@@ -1,8 +1,5 @@
 # Build directories
 build/
-input/
-output/
-data/
 
 # Environment variables and secrets
 .env
@@ -16,3 +13,6 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Ignore .nii.gz Files
+*nii.gz

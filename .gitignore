@@ -1,0 +1,18 @@
+# Build directories
+build/
+input/
+output/
+data/
+
+# Environment variables and secrets
+.env
+
+# Logs
+*.log
+!debug.log
+
+# OS generated files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

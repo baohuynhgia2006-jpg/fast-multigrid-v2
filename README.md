@@ -8,16 +8,13 @@ electric field for transcranial magnetic stimulation".
 This is an improved version of an older repository containing the implementation of the fast multigrid algorithm in C++. The older repository is no longer compatible with our uses and faces severe implementation flaws. Hence, we decided to simplify the code and migrate the implementation to this repository. The older pipeline lacks support for MNI-space, matsimnibs cooordinate file and was slower on average.
 
 ## GUIDE
-
-1. Ensure that you have CMake installed and ready.
-
-2. To build the tms_gmg_solver, use the following command and make sure you have zlib installed in your MYSYS2. If not, you can always use MYSYS2-MinGW64 command prompt to install zlib.
+1. To build the tms_gmg_solver, use the following command and make sure you have zlib installed in your MYSYS2. If not, you can always use MYSYS2-MinGW64 command prompt to install zlib.
 
 ```bash
 g++ -std=c++17 -O3 -march=native -fopenmp -DUSE_ZLIB main.cpp -lz -o tms_gmg_solver
 ```
 
-3. Once everything have been compiled and an .exe file is created. You can use the following command with these flags to run your simulation:
+2. Once everything have been compiled and an .exe file is created. You can use the following command with these flags to run your simulation:
 
 ```bash
 ./tms_gmg_solver path\to\final_tissues_MNI.nii path\to\Magstim_70mm_Fig8.ccd path\to\out_efield.nii --matsimnibs matsimnibs.txt --didt 1e6 --levels 4 --tol 1e-5

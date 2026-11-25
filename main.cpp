@@ -251,17 +251,29 @@ NiftiVolume load_charm_nifti(const std::string& path) {
 
 void save_nifti_float32(const std::string& out_path,
                         const Nifti1Header& ref_hdr,
-                        const std::vector<float>& data) {
+                        const std::vector<float>& data,
+                        int nt = 1) {
     Nifti1Header hdr = ref_hdr;
-    hdr.dim[0] = 3;
-    hdr.dim[4] = 1;
+    hdr.dim[0] = (nt > 1) ? 4 : 3;
+    hdr.dim[4] = static_cast<int16_t>(nt);
+    hdr.dim[5] = 1;
+    hdr.dim[6] = 1;
+    hdr.dim[7] = 1;
+    hdr.pixdim[4] = (nt > 1) ? 1.0f : 0.0f;
+    hdr.intent_code = 0;
     hdr.datatype = 16; // DT_FLOAT32
     hdr.bitpix = 32;
     hdr.vox_offset = 352.0f;
     hdr.scl_slope = 1.0f;
     hdr.scl_inter = 0.0f;
-    hdr.cal_min = 0.0f;
-    hdr.cal_max = data.empty() ? 0.0f : *std::max_element(data.begin(), data.end());
+    if (data.empty()) {
+        hdr.cal_min = 0.0f;
+        hdr.cal_max = 0.0f;
+    } else {
+        auto [mn, mx] = std::minmax_element(data.begin(), data.end());
+        hdr.cal_min = *mn;
+        hdr.cal_max = *mx;
+    }
     std::memcpy(hdr.magic, "n+1\0", 4);
 
     const uint8_t extender[4] = {0, 0, 0, 0};
@@ -812,19 +824,31 @@ void v_cycle_omp(std::vector<GridLevel>& levels, int l) {
 /*
     5. Electric Field Recover: E = -grad(phi) - A0.
 */
-std::vector<float> compute_efield_mag_unpadded(const GridLevel& fine,
-                                               const VoxelField3& A0,
-                                               const NiftiVolume& vol,
-                                               const PadInfo& pad) {
+struct EFieldOutput {
+    std::vector<float> mag; // 3D |E| (nx * ny * nz)
+    std::vector<float> vec; // 4D RAS+ world vector E: [Ex..., Ey..., Ez...] (3 * nx * ny * nz)
+};
+
+EFieldOutput compute_efield_unpadded(const GridLevel& fine,
+                                     const VoxelField3& A0,
+                                     const NiftiVolume& vol,
+                                     const PadInfo& pad,
+                                     bool want_vector) {
     const size_t n_orig = static_cast<size_t>(vol.nx) * vol.ny * vol.nz;
-    std::vector<float> emag(n_orig, 0.0f);
+    EFieldOutput out;
+    out.mag.assign(n_orig, 0.0f);
+    if (want_vector) {
+        out.vec.assign(3 * n_orig, 0.0f);
+    }
+
+    const GridAxes axes = extract_grid_axes(vol);
     const double inv_4h = 0.25 / fine.h;
 
     OMP_PARALLEL_FOR_COLLAPSE2
     for (int k = 0; k < vol.nz; ++k) {
         for (int j = 0; j < vol.ny; ++j) {
             for (int i = 0; i < vol.nx; ++i) {
-                size_t orig_idx = (static_cast<size_t>(k) * vol.ny + j) * vol.nx + i;
+                const size_t orig_idx = (static_cast<size_t>(k) * vol.ny + j) * vol.nx + i;
                 if (vol.labels[orig_idx] == 0) continue; // Mask outside head
 
                 const int ip = i + pad.pad_x;
@@ -845,17 +869,28 @@ std::vector<float> compute_efield_mag_unpadded(const GridLevel& fine,
                 const double dphidz = inv_4h * ((p001 - p000) + (p101 - p100) + (p011 - p010) + (p111 - p110));
 
                 const size_t v = fine.v_idx(ip, jp, kp);
-                const double ex = -dphidx - A0.x[v];
-                const double ey = -dphidy - A0.y[v];
-                const double ez = -dphidz - A0.z[v];
+                // Grid-axis E components (along voxel i, j, k axes)
+                const double ex_g = -dphidx - A0.x[v];
+                const double ey_g = -dphidy - A0.y[v];
+                const double ez_g = -dphidz - A0.z[v];
 
-                emag[orig_idx] = static_cast<float>(std::sqrt(ex * ex + ey * ey + ez * ez));
+                out.mag[orig_idx] = static_cast<float>(std::sqrt(ex_g * ex_g + ey_g * ey_g + ez_g * ez_g));
+
+                if (want_vector) {
+                    // Transform back to world RAS+ coordinates: E_w = ex_g*ux + ey_g*uy + ez_g*uz
+                    const double ex_w = ex_g * axes.ux[0] + ey_g * axes.uy[0] + ez_g * axes.uz[0];
+                    const double ey_w = ex_g * axes.ux[1] + ey_g * axes.uy[1] + ez_g * axes.uz[1];
+                    const double ez_w = ex_g * axes.ux[2] + ey_g * axes.uy[2] + ez_g * axes.uz[2];
+
+                    out.vec[orig_idx]              = static_cast<float>(ex_w);
+                    out.vec[orig_idx + n_orig]     = static_cast<float>(ey_w);
+                    out.vec[orig_idx + 2 * n_orig] = static_cast<float>(ez_w);
+                }
             }
         }
     }
-    return emag;
+    return out;
 }
-
 /*
     6. CLI Entry Points
 */
@@ -867,7 +902,8 @@ static void print_usage(const char* prog) {
               << "  --levels <L>          Multigrid levels (default: 4)\n"
               << "  --tol <val>           Relative residual tolerance (default: 1e-5)\n"
               << "  --max-iter <N>        Maximum V-cycles (default: 30)\n"
-              << "  --no-smooth           Skip 3x3x3 conductivity smoothing\n";
+              << "  --no-smooth           Skip 3x3x3 conductivity smoothing\n"
+              << "  --out-vec <file>      Save 4D world-space (RAS+) vector E (nx,ny,nz,3)\n";
 }
 
 int main(int argc, char** argv) {
@@ -879,6 +915,7 @@ int main(int argc, char** argv) {
     const std::string nifti_path = argv[1];
     const std::string ccd_path   = argv[2];
     const std::string out_path   = argv[3];
+    std::string out_vec_path;
 
     std::string mat_path;
     double didt = 1e6;       // 1 A/us (SimNIBS default)
@@ -895,6 +932,7 @@ int main(int argc, char** argv) {
         else if (arg == "--tol" && a + 1 < argc)        tol = std::stod(argv[++a]);
         else if (arg == "--max-iter" && a + 1 < argc)   max_iter = std::stoi(argv[++a]);
         else if (arg == "--no-smooth")                  do_smooth = false;
+        else if (arg == "--out-vec" && a + 1 < argc)    out_vec_path = argv[++a];
         else {
             std::cerr << "Unknown or incomplete option: " << arg << "\n";
             print_usage(argv[0]);
@@ -984,13 +1022,22 @@ int main(int argc, char** argv) {
         std::cout << "Multigrid solve finished in " << std::fixed << std::setprecision(2)
                   << elapsed_s(t_solve) << " s\n";
 
-        // 6. Compute |E| (V/m) and save output NIfTI
+        // 6. Compute |E| (and optionally RAS+ vector E) and save NIfTI
         t0 = Clock::now();
-        auto emag = compute_efield_mag_unpadded(levels[0], A0, vol, pad);
-        float max_e = emag.empty() ? 0.0f : *std::max_element(emag.begin(), emag.end());
-        save_nifti_float32(out_path, vol.hdr, emag);
+        const bool want_vec = !out_vec_path.empty();
+        auto efield = compute_efield_unpadded(levels[0], A0, vol, pad, want_vec);
+        float max_e = efield.mag.empty() ? 0.0f
+                      : *std::max_element(efield.mag.begin(), efield.mag.end());
+        save_nifti_float32(out_path, vol.hdr, efield.mag, 1);
         std::cout << "Saved |E| to " << out_path << " (max |E| = " << std::fixed
                   << std::setprecision(3) << max_e << " V/m) [" << elapsed_s(t0) << " s]\n";
+
+        if (want_vec) {
+            t0 = Clock::now();
+            save_nifti_float32(out_vec_path, vol.hdr, efield.vec, 3);
+            std::cout << "Saved vector E (RAS+) to " << out_vec_path
+                      << " [" << std::fixed << std::setprecision(2) << elapsed_s(t0) << " s]\n";
+        }
 
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << "\n";
